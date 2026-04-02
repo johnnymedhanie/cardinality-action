@@ -19,14 +19,14 @@ inputs:
     description: 'GitHub token used to post PR comments and status updates'
     required: false
   target-mode:
-    description: 'Execution target mode: local or preview'
+    description: 'How Cardinality should resolve the runnable app target: local or preview'
     required: false
     default: 'local'
   dev-command:
-    description: 'Command used to start a local app in target-mode=local'
+    description: 'Command used to start the app locally when target-mode=local'
     required: false
   preview-url:
-    description: 'Explicit preview deployment URL when target-mode=preview'
+    description: 'Explicit preview URL to test when target-mode=preview'
     required: false
   base-url:
     description: 'Base URL of your running application for testing'
@@ -53,7 +53,7 @@ inputs:
     required: false
     default: '60'
   time-budget:
-    description: 'Maximum test budget in seconds for prioritized properties'
+    description: 'Seconds budget for property prioritization (default: 180)'
     required: false
     default: '180'
 runs:

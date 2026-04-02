@@ -30066,7 +30066,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
-const child_process_1 = __nccwpck_require__(5317);
+const node_child_process_1 = __nccwpck_require__(1421);
 const docker_js_1 = __nccwpck_require__(3871);
 // ---------------------------------------------------------------------------
 // Constants
@@ -30102,6 +30102,72 @@ async function post(url, body, apiKey) {
         throw new Error(`${res.status}: ${text}`);
     }
     return (await res.json());
+}
+function readOutput(stream, label) {
+    stream.on('data', (chunk) => {
+        const text = chunk.toString().trimEnd();
+        if (text.length > 0) {
+            core.info(`${label}: ${text}`);
+        }
+    });
+}
+function startLocalCommand(command) {
+    const child = (0, node_child_process_1.spawn)(command, {
+        shell: true,
+        env: process.env,
+        cwd: process.env.GITHUB_WORKSPACE || '.',
+        stdio: 'pipe',
+    });
+    readOutput(child.stdout, 'local');
+    readOutput(child.stderr, 'local');
+    return child;
+}
+async function stopLocalCommand(child) {
+    if (!child || child.killed)
+        return;
+    child.kill('SIGTERM');
+    await new Promise((resolve) => {
+        const timeout = setTimeout(() => {
+            child.kill('SIGKILL');
+            resolve();
+        }, 5000);
+        child.once('exit', () => {
+            clearTimeout(timeout);
+            resolve();
+        });
+    });
+}
+async function resolvePreviewUrl(explicitPreviewUrl, octokit) {
+    if (explicitPreviewUrl)
+        return explicitPreviewUrl;
+    if (!octokit) {
+        throw new Error('preview-url is required when no GitHub token is available');
+    }
+    const { owner, repo } = github.context.repo;
+    try {
+        const { data: deployments } = await octokit.rest.repos.listDeployments({
+            owner,
+            repo,
+            sha: github.context.sha,
+            per_page: 20,
+        });
+        for (const deployment of deployments) {
+            const { data: statuses } = await octokit.rest.repos.listDeploymentStatuses({
+                owner,
+                repo,
+                deployment_id: deployment.id,
+                per_page: 20,
+            });
+            const match = statuses.find((status) => typeof status.environment_url === 'string' && status.environment_url.length > 0);
+            if (match?.environment_url) {
+                return match.environment_url;
+            }
+        }
+    }
+    catch (error) {
+        core.warning(`GitHub deployment lookup failed: ${error.message}`);
+    }
+    throw new Error('Could not resolve a preview URL from GitHub deployment metadata');
 }
 function prioritizeProperties(properties, changedFiles, baselineComparison, timeBudgetSeconds = 180) {
     const changedSet = new Set(changedFiles.map(f => f.toLowerCase()));
@@ -30173,12 +30239,29 @@ function scopeProperties(properties, changedFiles, isDefaultBranch) {
 // ---------------------------------------------------------------------------
 // Comment formatting
 // ---------------------------------------------------------------------------
-function formatEnrichedComment(enriched, scopeInfo, durationMs, violations, appUrl) {
+function formatEnrichedComment(enriched, scopeInfo, durationMs, violations) {
     const lines = [];
     // Header
-    const headerIcon = enriched.conclusion === 'failure' ? '✖' : enriched.conclusion === 'success' ? '✔' : '•';
-    lines.push(`### ${headerIcon} Cardinality — ${enriched.headline}\n`);
-    lines.push(`> Repo support: **${enriched.supportStatus.replace('_', ' ')}**${enriched.targetMode ? ` • target mode: \`${enriched.targetMode}\`` : ''}\n`);
+    const headerByOutcome = {
+        supported_pass: '### ✔ Cardinality — All checked supported properties passed\n',
+        supported_fail: `### ✖ Cardinality — ${enriched.bugsFound} supported regression${enriched.bugsFound !== 1 ? 's' : ''} found\n`,
+        best_effort_findings: `### ⚠ Cardinality — Best-effort findings detected (${enriched.bugsFound})\n`,
+        best_effort_no_findings: '### ⚠ Cardinality — Best-effort run found no issues; this is not a clean bill\n',
+        scan_only: '### ○ Cardinality — Properties cataloged, not tested\n',
+        target_unresolved: '### ○ Cardinality — Could not resolve test target\n',
+        setup_failed: '### ○ Cardinality — Cardinality setup failed\n',
+        inconclusive: '### ○ Cardinality — Run inconclusive\n',
+    };
+    lines.push(headerByOutcome[enriched.outcome ?? ''] ?? (enriched.bugsFound > 0
+        ? `### ✖ Cardinality — ${enriched.bugsFound} violation${enriched.bugsFound !== 1 ? 's' : ''} found\n`
+        : '### ○ Cardinality — Run completed\n'));
+    if (enriched.supportStatus) {
+        const prettySupport = enriched.supportStatus.replace(/_/g, ' ');
+        lines.push(`> Repo support: **${prettySupport}**\n`);
+    }
+    if (enriched.supportReasons && enriched.supportReasons[0]) {
+        lines.push(`> ${enriched.supportReasons[0]}\n`);
+    }
     // Scope info
     if (scopeInfo.mode === 'scoped') {
         const skippedNote = scopeInfo.skipped
@@ -30269,15 +30352,11 @@ function formatEnrichedComment(enriched, scopeInfo, durationMs, violations, appU
             lines.push(`</details>\n`);
         }
     }
-    if (enriched.supportReasons.length > 0) {
-        lines.push(`**Support notes:** ${enriched.supportReasons.join(' ')}`);
-    }
-    lines.push(`**Run:** [View details](${appUrl}/runs/${enriched.runId})`);
     lines.push('---');
-    lines.push(`*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`);
+    lines.push('*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*');
     return lines.join('\n');
 }
-function formatScanOnlyComment(scan, appUrl) {
+function formatScanOnlyComment(scan) {
     const lines = [];
     lines.push(`### ✔ Cardinality — ${scan.properties.length} properties inferred\n`);
     lines.push(`| Status | Property | Severity | File |`);
@@ -30288,22 +30367,22 @@ function formatScanOnlyComment(scan, appUrl) {
     lines.push('');
     lines.push(`**${scan.stats.routesFound}** routes, **${scan.stats.modelsFound}** models, **${scan.stats.filesAnalyzed}** files analyzed in **${(scan.stats.duration / 1000).toFixed(1)}s**`);
     lines.push('\n---');
-    lines.push(`*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`);
+    lines.push('*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*');
     return lines.join('\n');
 }
-function formatNoOpComment(reason, propertiesTotal, appUrl, headline = 'No relevant properties affected') {
+function formatNoOpComment(reason, propertiesTotal) {
     return [
-        `### • Cardinality — ${headline}\n`,
+        `### ✔ Cardinality — No relevant properties affected\n`,
         `> ${reason}`,
         `\n${propertiesTotal} total properties in this repo.\n`,
         '---',
-        `*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`,
+        '*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*',
     ].join('\n');
 }
 // ---------------------------------------------------------------------------
 // PR comment / check run upsert
 // ---------------------------------------------------------------------------
-async function upsertPrComment(octokit, body, conclusion = 'neutral') {
+async function upsertPrComment(octokit, body) {
     if (!octokit) {
         core.warning('Skipping GitHub comment/check reporting because no GitHub token was provided.');
         return;
@@ -30330,7 +30409,7 @@ async function upsertPrComment(octokit, body, conclusion = 'neutral') {
         const { owner, repo } = context.repo;
         await octokit.rest.checks.create({
             owner, repo, name: 'Cardinality — Correctness Testing',
-            head_sha: context.sha, status: 'completed', conclusion,
+            head_sha: context.sha, status: 'completed', conclusion: 'neutral',
             output: { title: 'Cardinality Results', summary: markedBody },
         });
         core.info(`Created check run on commit ${context.sha}`);
@@ -30356,80 +30435,6 @@ async function getChangedFiles(octokit) {
         return [];
     }
 }
-function originFromUrl(value) {
-    try {
-        return new URL(value).origin;
-    }
-    catch {
-        return null;
-    }
-}
-function startLocalProcess(command) {
-    core.info(`Starting local target: ${command}`);
-    const child = (0, child_process_1.spawn)(command, {
-        shell: true,
-        detached: true,
-        stdio: 'inherit',
-        env: process.env,
-    });
-    return child;
-}
-async function stopLocalProcess(child) {
-    if (!child?.pid)
-        return;
-    try {
-        process.kill(-child.pid, 'SIGTERM');
-    }
-    catch (err) {
-        core.warning(`Failed to stop local target cleanly: ${err.message}`);
-    }
-}
-async function resolvePreviewUrl(octokit, explicitPreviewUrl) {
-    if (explicitPreviewUrl) {
-        return explicitPreviewUrl;
-    }
-    if (!octokit) {
-        return null;
-    }
-    const { owner, repo } = github.context.repo;
-    try {
-        const combined = await octokit.rest.repos.getCombinedStatusForRef({
-            owner,
-            repo,
-            ref: github.context.sha,
-        });
-        for (const status of combined.data.statuses ?? []) {
-            if (status.target_url?.includes('.vercel.app')) {
-                return status.target_url;
-            }
-        }
-    }
-    catch {
-        // Fall through to checks lookup
-    }
-    try {
-        const checks = await octokit.rest.checks.listForRef({
-            owner,
-            repo,
-            ref: github.context.sha,
-            per_page: 100,
-        });
-        for (const check of checks.data.check_runs ?? []) {
-            if (check.details_url?.includes('.vercel.app')) {
-                return check.details_url;
-            }
-            const summary = check.output?.summary ?? '';
-            const match = summary.match(/https:\/\/[a-zA-Z0-9-]+\.vercel\.app[^\s)"]*/);
-            if (match) {
-                return match[0];
-            }
-        }
-    }
-    catch {
-        return null;
-    }
-    return null;
-}
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -30440,8 +30445,7 @@ async function run() {
         const apiKey = core.getInput('api-key', { required: true });
         const engineUrl = core.getInput('engine-url').replace(/\/+$/, '');
         const appUrl = core.getInput('app-url') || 'https://cardinality.vercel.app';
-        const targetModeInput = core.getInput('target-mode') || 'local';
-        const targetMode = targetModeInput === 'preview' ? 'preview' : 'local';
+        const targetMode = (core.getInput('target-mode') || 'local');
         const devCommand = core.getInput('dev-command');
         const previewUrlInput = core.getInput('preview-url');
         const baseUrlInput = core.getInput('base-url');
@@ -30452,7 +30456,6 @@ async function run() {
         const dockerComposeService = core.getInput('docker-compose-service');
         const waitForUrl = core.getInput('wait-for');
         const startupTimeout = parseInt(core.getInput('startup-timeout') || '60', 10);
-        let localProcess = null;
         const octokit = ghToken ? github.getOctokit(ghToken) : null;
         if (!ghToken) {
             core.warning('No GitHub token available; falling back to full-scope testing and skipping GitHub reporting.');
@@ -30464,68 +30467,39 @@ async function run() {
         const branch = isPR
             ? pullRequest?.head?.ref ?? ''
             : github.context.ref?.replace('refs/heads/', '') ?? '';
-        // 2. Start the requested target mode
+        // 2. Start a local target when requested
         let dockerStarted = false;
-        let effectiveBaseUrl = '';
-        if (targetMode === 'local') {
-            core.startGroup('Resolving local test target');
+        let localProcess = null;
+        let resolvedBaseUrl = baseUrlInput || '';
+        if (!scanOnly && targetMode === 'local' && devCommand) {
+            core.startGroup('Starting local application');
             try {
-                if (dockerComposeFile) {
-                    await (0, docker_js_1.startDockerCompose)(dockerComposeFile, dockerComposeService || undefined);
-                    dockerStarted = true;
-                }
-                else if (devCommand) {
-                    localProcess = startLocalProcess(devCommand);
-                }
-                effectiveBaseUrl = baseUrlInput || originFromUrl(waitForUrl) || '';
-                if (!effectiveBaseUrl) {
-                    throw new Error('Local target mode requires base-url or wait-for to resolve a runnable target');
-                }
-                await (0, docker_js_1.waitForHealthy)(waitForUrl || effectiveBaseUrl, startupTimeout);
+                localProcess = startLocalCommand(devCommand);
+                const healthUrl = waitForUrl || baseUrlInput || 'http://127.0.0.1:3000';
+                await (0, docker_js_1.waitForHealthy)(healthUrl, startupTimeout);
+                resolvedBaseUrl = baseUrlInput || healthUrl.replace(/\/health$/, '');
             }
             catch (err) {
-                try {
-                    await post(`${appUrl}/api/ci/report`, {
-                        kind: 'failed',
-                        repoFullName,
-                        branch,
-                        commitSha: github.context.sha,
-                        failureStage: 'target',
-                        errorDetails: err.message,
-                    }, apiKey);
-                }
-                catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatNoOpComment(err.message, 0, appUrl, 'Could not resolve test target'), 'neutral');
+                await stopLocalCommand(localProcess);
+                core.endGroup();
                 throw err;
             }
-            finally {
-                core.endGroup();
-            }
+            core.endGroup();
         }
-        else {
-            core.startGroup('Resolving preview test target');
+        else if (!scanOnly && targetMode === 'local' && dockerComposeFile) {
+            core.startGroup('Starting application via docker-compose');
             try {
-                effectiveBaseUrl = await resolvePreviewUrl(octokit, previewUrlInput) ?? '';
-                if (!effectiveBaseUrl) {
-                    throw new Error('Preview target mode could not find a preview URL. Provide preview-url or expose a Vercel preview via GitHub statuses.');
-                }
-                await (0, docker_js_1.waitForHealthy)(waitForUrl || effectiveBaseUrl, startupTimeout);
+                await (0, docker_js_1.startDockerCompose)(dockerComposeFile, dockerComposeService || undefined);
+                dockerStarted = true;
+                const healthUrl = waitForUrl || baseUrlInput || 'http://localhost:3000/health';
+                await (0, docker_js_1.waitForHealthy)(healthUrl, startupTimeout);
+                resolvedBaseUrl = baseUrlInput || healthUrl.replace(/\/health$/, '');
             }
             catch (err) {
-                const message = err.message;
-                try {
-                    await post(`${appUrl}/api/ci/report`, {
-                        kind: 'failed',
-                        repoFullName,
-                        branch,
-                        commitSha: github.context.sha,
-                        failureStage: 'target',
-                        errorDetails: message,
-                    }, apiKey);
-                }
-                catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatNoOpComment(message, 0, appUrl, 'Could not resolve test target'), 'neutral');
-                throw new Error(message);
+                if (dockerStarted)
+                    await (0, docker_js_1.stopDockerCompose)(dockerComposeFile);
+                core.endGroup();
+                throw err;
             }
             core.endGroup();
         }
@@ -30539,12 +30513,31 @@ async function run() {
             }, apiKey);
             core.info(`Found ${scanResult.properties.length} properties across ${scanResult.stats.routesFound} routes`);
             core.endGroup();
+            let effectiveBaseUrl = resolvedBaseUrl;
+            if (!scanOnly && targetMode === 'preview') {
+                try {
+                    effectiveBaseUrl = await resolvePreviewUrl(previewUrlInput, octokit);
+                    await (0, docker_js_1.waitForHealthy)(waitForUrl || effectiveBaseUrl, startupTimeout);
+                }
+                catch (err) {
+                    await post(`${appUrl}/api/ci/report`, {
+                        kind: 'failed',
+                        repoFullName,
+                        branch,
+                        commitSha: github.context.sha,
+                        failureStage: 'target_resolution',
+                        errorDetails: err.message,
+                        targetMode,
+                    }, apiKey).catch(() => undefined);
+                    await upsertPrComment(octokit, '### ○ Cardinality — Could not resolve test target\n\nPreview deployment could not be located or did not become healthy in time.');
+                    throw err;
+                }
+            }
             // 4. If scan-only or no base-url, post scan comment and exit
             if (scanOnly || !effectiveBaseUrl) {
                 if (!scanOnly && !effectiveBaseUrl) {
-                    core.warning('base-url not provided — skipping testing.');
+                    core.warning('No runnable target URL was resolved — skipping testing.');
                 }
-                // Report scan-only to app
                 try {
                     await post(`${appUrl}/api/ci/report`, {
                         kind: 'no_op',
@@ -30557,10 +30550,13 @@ async function run() {
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatScanOnlyComment(scanResult, appUrl), 'neutral');
+                const noOpComment = scanOnly
+                    ? formatScanOnlyComment(scanResult)
+                    : '### ○ Cardinality — Run inconclusive\n\nCardinality could not resolve a runnable target for this repository, so properties were cataloged but not tested.';
+                await upsertPrComment(octokit, noOpComment);
                 core.setOutput('properties-count', scanResult.properties.length);
                 core.setOutput('bugs-found', 0);
-                core.setOutput('score', 100);
+                core.setOutput('score', 0);
                 return;
             }
             // 5. Incremental scoping
@@ -30601,7 +30597,7 @@ async function run() {
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length, appUrl), 'neutral');
+                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length));
                 core.setOutput('properties-count', scanResult.properties.length);
                 core.setOutput('bugs-found', 0);
                 core.setOutput('score', 100);
@@ -30666,6 +30662,7 @@ async function run() {
                         runId: initResponse.runId,
                         failureStage: 'test',
                         errorDetails: err.message,
+                        targetMode,
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
@@ -30693,6 +30690,7 @@ async function run() {
                             runId: initResponse.runId,
                             failureStage: 'report',
                             errorDetails: err.message,
+                            targetMode,
                         }, apiKey);
                     }
                     catch { /* non-fatal */ }
@@ -30711,6 +30709,7 @@ async function run() {
                     runId: initResponse.runId,
                     testRunResult,
                     feedbackDurationMs,
+                    targetMode,
                 }, apiKey);
             }
             catch (err) {
@@ -30720,6 +30719,7 @@ async function run() {
                         runId: initResponse.runId,
                         failureStage: 'report',
                         errorDetails: err.message,
+                        targetMode,
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
@@ -30735,8 +30735,8 @@ async function run() {
                 mode,
                 reason,
                 skipped: skippedProperties.length,
-            }, feedbackDurationMs, testRunResult.violations, appUrl);
-            await upsertPrComment(octokit, commentBody, enriched.conclusion);
+            }, feedbackDurationMs, testRunResult.violations);
+            await upsertPrComment(octokit, commentBody);
             core.endGroup();
             // 12. Set outputs
             core.setOutput('properties-count', scanResult.properties.length);
@@ -30744,10 +30744,10 @@ async function run() {
             const passedProperties = enriched.confidenceByProperty.filter((property) => property.passed).length;
             const score = enriched.propertiesTested > 0
                 ? Math.round((passedProperties / enriched.propertiesTested) * 100)
-                : 100;
+                : 0;
             core.setOutput('score', score);
             // 13. Pass/fail based on threshold
-            if (failOn !== 'never' && enriched.conclusion === 'failure') {
+            if (failOn !== 'never' && enriched.outcome === 'supported_fail') {
                 const failingViolations = testRunResult.violations.filter(v => severityMeetsThreshold(v.severity, failOn));
                 if (failingViolations.length > 0) {
                     const severities = [...new Set(failingViolations.map(v => v.severity))].join(', ');
@@ -30756,13 +30756,15 @@ async function run() {
             }
         }
         finally {
+            if (localProcess) {
+                core.startGroup('Stopping local application');
+                await stopLocalCommand(localProcess);
+                core.endGroup();
+            }
             if (dockerStarted && dockerComposeFile) {
                 core.startGroup('Stopping docker-compose');
                 await (0, docker_js_1.stopDockerCompose)(dockerComposeFile);
                 core.endGroup();
-            }
-            if (localProcess) {
-                await stopLocalProcess(localProcess);
             }
         }
     }
@@ -30877,6 +30879,14 @@ module.exports = require("https");
 
 "use strict";
 module.exports = require("net");
+
+/***/ }),
+
+/***/ 1421:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:child_process");
 
 /***/ }),
 
