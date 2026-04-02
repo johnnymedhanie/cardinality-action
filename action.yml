@@ -1,0 +1,61 @@
+name: 'Cardinality — Correctness Testing'
+description: 'Automatically infer correctness properties and test your API'
+branding:
+  icon: 'shield'
+  color: 'red'
+inputs:
+  api-key:
+    description: 'Your Cardinality API key'
+    required: true
+  engine-url:
+    description: 'Cardinality engine URL'
+    required: false
+    default: 'https://cardinality-engine-production.up.railway.app'
+  app-url:
+    description: 'Cardinality app URL for CI report persistence'
+    required: false
+    default: 'https://cardinality.vercel.app'
+  github-token:
+    description: 'GitHub token used to post PR comments and status updates'
+    required: false
+  target-mode:
+    description: 'Execution target mode: local or preview'
+    required: false
+    default: 'local'
+  dev-command:
+    description: 'Command used to start a local app in target-mode=local'
+    required: false
+  preview-url:
+    description: 'Explicit preview deployment URL when target-mode=preview'
+    required: false
+  base-url:
+    description: 'Base URL of your running application for testing'
+    required: false
+  scan-only:
+    description: 'Only scan for properties, skip testing'
+    required: false
+    default: 'false'
+  fail-on:
+    description: 'Fail the check on: critical, high, medium, low, never'
+    required: false
+    default: 'critical'
+  docker-compose-file:
+    description: 'Path to docker-compose file for starting your app'
+    required: false
+  docker-compose-service:
+    description: 'Specific service to wait for (default: all services)'
+    required: false
+  wait-for:
+    description: 'URL to poll for health check (default: base-url or http://localhost:3000/health)'
+    required: false
+  startup-timeout:
+    description: 'Seconds to wait for app startup (default: 60)'
+    required: false
+    default: '60'
+  time-budget:
+    description: 'Maximum test budget in seconds for prioritized properties'
+    required: false
+    default: '180'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
