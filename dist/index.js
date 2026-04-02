@@ -30239,7 +30239,7 @@ function scopeProperties(properties, changedFiles, isDefaultBranch) {
 // ---------------------------------------------------------------------------
 // Comment formatting
 // ---------------------------------------------------------------------------
-function formatEnrichedComment(enriched, scopeInfo, durationMs, violations) {
+function formatEnrichedComment(enriched, scopeInfo, durationMs, violations, appUrl) {
     const lines = [];
     // Header
     const headerByOutcome = {
@@ -30353,10 +30353,13 @@ function formatEnrichedComment(enriched, scopeInfo, durationMs, violations) {
         }
     }
     lines.push('---');
-    lines.push('*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*');
+    if (enriched.runId) {
+        lines.push(`**Run:** [View details](${appUrl}/runs/${enriched.runId})`);
+    }
+    lines.push(`*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`);
     return lines.join('\n');
 }
-function formatScanOnlyComment(scan) {
+function formatScanOnlyComment(scan, appUrl) {
     const lines = [];
     lines.push(`### ✔ Cardinality — ${scan.properties.length} properties inferred\n`);
     lines.push(`| Status | Property | Severity | File |`);
@@ -30367,16 +30370,16 @@ function formatScanOnlyComment(scan) {
     lines.push('');
     lines.push(`**${scan.stats.routesFound}** routes, **${scan.stats.modelsFound}** models, **${scan.stats.filesAnalyzed}** files analyzed in **${(scan.stats.duration / 1000).toFixed(1)}s**`);
     lines.push('\n---');
-    lines.push('*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*');
+    lines.push(`*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`);
     return lines.join('\n');
 }
-function formatNoOpComment(reason, propertiesTotal) {
+function formatNoOpComment(reason, propertiesTotal, appUrl) {
     return [
         `### ✔ Cardinality — No relevant properties affected\n`,
         `> ${reason}`,
         `\n${propertiesTotal} total properties in this repo.\n`,
         '---',
-        '*Found by [Cardinality](https://cardinality.dev) — autonomous correctness testing*',
+        `*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`,
     ].join('\n');
 }
 // ---------------------------------------------------------------------------
@@ -30551,7 +30554,7 @@ async function run() {
                 }
                 catch { /* non-fatal */ }
                 const noOpComment = scanOnly
-                    ? formatScanOnlyComment(scanResult)
+                    ? formatScanOnlyComment(scanResult, appUrl)
                     : '### ○ Cardinality — Run inconclusive\n\nCardinality could not resolve a runnable target for this repository, so properties were cataloged but not tested.';
                 await upsertPrComment(octokit, noOpComment);
                 core.setOutput('properties-count', scanResult.properties.length);
@@ -30597,7 +30600,7 @@ async function run() {
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length));
+                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length, appUrl));
                 core.setOutput('properties-count', scanResult.properties.length);
                 core.setOutput('bugs-found', 0);
                 core.setOutput('score', 100);
@@ -30735,7 +30738,7 @@ async function run() {
                 mode,
                 reason,
                 skipped: skippedProperties.length,
-            }, feedbackDurationMs, testRunResult.violations);
+            }, feedbackDurationMs, testRunResult.violations, appUrl);
             await upsertPrComment(octokit, commentBody);
             core.endGroup();
             // 12. Set outputs
