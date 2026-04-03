@@ -30063,10 +30063,16 @@ var __importStar = (this && this.__importStar) || (function () {
         return result;
     };
 })();
+var __importDefault = (this && this.__importDefault) || function (mod) {
+    return (mod && mod.__esModule) ? mod : { "default": mod };
+};
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
+const node_crypto_1 = __nccwpck_require__(7598);
 const node_child_process_1 = __nccwpck_require__(1421);
+const promises_1 = __nccwpck_require__(1455);
+const node_path_1 = __importDefault(__nccwpck_require__(6760));
 const docker_js_1 = __nccwpck_require__(3871);
 // ---------------------------------------------------------------------------
 // Constants
@@ -30125,12 +30131,12 @@ function readOutput(stream, label) {
         }
     });
 }
-function startLocalCommand(command) {
+function startLocalCommand(command, cwd = process.env.GITHUB_WORKSPACE || '.') {
     const child = (0, node_child_process_1.spawn)(command, {
         shell: true,
         detached: process.platform !== 'win32',
         env: process.env,
-        cwd: process.env.GITHUB_WORKSPACE || '.',
+        cwd,
         stdio: 'pipe',
     });
     readOutput(child.stdout, 'local');
@@ -30246,6 +30252,136 @@ async function resolvePreviewUrl(explicitPreviewUrl, octokit, sha) {
         core.warning(`GitHub deployment lookup failed: ${error.message}`);
     }
     throw new Error('Could not resolve a preview URL from GitHub deployment metadata');
+}
+function validateManifestSignature(response) {
+    const manifestSecret = process.env.CARDINALITY_MANIFEST_SECRET ?? process.env.CARDINALITY_ENGINE_SECRET;
+    if (!manifestSecret) {
+        return;
+    }
+    const payload = JSON.stringify({ manifest: response.manifest, expiresAt: response.expiresAt });
+    const digest = (0, node_crypto_1.createHmac)('sha256', manifestSecret).update(payload).digest('hex');
+    if (digest !== response.signature) {
+        throw new Error('Manifest signature validation failed.');
+    }
+    if (Date.parse(response.expiresAt) < Date.now()) {
+        throw new Error('Manifest has expired.');
+    }
+}
+function countManifestStatuses(result) {
+    return result.propertyResults.reduce((acc, propertyResult) => {
+        acc[propertyResult.status] += 1;
+        return acc;
+    }, { checked: 0, violated: 0, not_reached: 0, skipped: 0, errored: 0 });
+}
+function deriveManifestDurationMs(result) {
+    if (!result.startedAt || !result.finishedAt)
+        return 0;
+    const diff = Date.parse(result.finishedAt) - Date.parse(result.startedAt);
+    return Number.isNaN(diff) || diff < 0 ? 0 : diff;
+}
+function formatManifestComment(manifestResponse, result, appUrl) {
+    const counts = countManifestStatuses(result);
+    const total = result.propertyResults.length;
+    const durationMs = deriveManifestDurationMs(result);
+    const durationSeconds = Math.round(durationMs / 1000);
+    const durationLabel = durationSeconds < 60
+        ? `${durationSeconds}s`
+        : `${Math.floor(durationSeconds / 60)}m ${durationSeconds % 60}s`;
+    const ruleSourceSummary = Object.entries(manifestResponse.summary.selectedRuleCounts)
+        .filter(([, count]) => count > 0)
+        .map(([source, count]) => `${source}: ${count}`)
+        .join(', ');
+    const lines = [
+        '### Cardinality — Manifest verification',
+        '',
+        `> Target: **${manifestResponse.summary.targetName}**`,
+        `> Rules: ${total} selected${ruleSourceSummary ? ` (${ruleSourceSummary})` : ''}`,
+        `> Results: ${counts.checked} checked, ${counts.violated} violated, ${counts.not_reached} not reached, ${counts.errored} errored`,
+        `> Duration: ${durationLabel}`,
+    ];
+    if (manifestResponse.runId) {
+        lines.push('', `**Run:** [View details](${appUrl}/runs/${manifestResponse.runId})`);
+    }
+    lines.push('---', `*Found by [Cardinality](${appUrl}) — autonomous correctness testing*`);
+    return lines.join('\n');
+}
+async function resolveRepoPathAssets(manifest, projectDir) {
+    const next = structuredClone(manifest);
+    const existingRuleIds = new Set(next.rules.map((rule) => rule.ruleId));
+    for (const asset of next.specAssets ?? []) {
+        if (asset.sourceType !== 'repo_path' || asset.content || !asset.repoPath) {
+            continue;
+        }
+        const absolutePath = node_path_1.default.isAbsolute(asset.repoPath)
+            ? asset.repoPath
+            : node_path_1.default.join(projectDir, asset.repoPath);
+        asset.content = await (0, promises_1.readFile)(absolutePath, 'utf8');
+        for (const exportName of extractBombadilExports(asset.content)) {
+            const ruleId = `${asset.assetId}:${exportName}`;
+            if (existingRuleIds.has(ruleId)) {
+                continue;
+            }
+            next.rules.push({
+                ruleId,
+                identifier: toBombadilIdentifier(`${asset.assetId}_${exportName}`),
+                source: 'repo_path',
+                rulePackSourceId: asset.assetId,
+                selectionReason: asset.selectionReason,
+                executorFamily: 'bombadil',
+                checkabilityStatus: 'ready',
+                kind: 'module_export',
+                moduleSpecifier: `./cardinality.asset.${asset.assetId}.ts`,
+                exportName,
+                description: `${asset.name}:${exportName}`,
+            });
+            existingRuleIds.add(ruleId);
+        }
+    }
+    return next;
+}
+function extractBombadilExports(source) {
+    const matches = new Set();
+    for (const match of source.matchAll(/export\s+const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=/g)) {
+        matches.add(match[1]);
+    }
+    for (const match of source.matchAll(/export\s+async\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+        matches.add(match[1]);
+    }
+    for (const match of source.matchAll(/export\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(/g)) {
+        matches.add(match[1]);
+    }
+    return Array.from(matches);
+}
+function toBombadilIdentifier(input) {
+    const cleaned = input.replace(/[^A-Za-z0-9_]+/g, '_').replace(/^_+/, '').replace(/_+$/, '');
+    const normalized = cleaned.length > 0 ? cleaned : 'rule';
+    return /^[A-Za-z_]/.test(normalized) ? normalized : `rule_${normalized}`;
+}
+function createErroredManifestResult(manifest, targetUrl, error, startedAt) {
+    const timestamp = new Date().toISOString();
+    return {
+        manifestId: manifest.manifestId,
+        targetUrl,
+        startedAt,
+        finishedAt: timestamp,
+        exitCode: 1,
+        timedOut: false,
+        cancelled: false,
+        evidence: {
+            screenshotPaths: [],
+        },
+        propertyResults: manifest.rules.map((rule) => ({
+            ruleId: rule.ruleId,
+            identifier: rule.identifier,
+            status: 'errored',
+            message: error.message,
+            timestamp,
+        })),
+        logs: {
+            stdout: '',
+            stderr: error.stack ?? error.message,
+        },
+    };
 }
 function prioritizeProperties(properties, changedFiles, baselineComparison, timeBudgetSeconds = 180) {
     const changedSet = new Set(changedFiles.map(f => f.toLowerCase()));
@@ -30516,6 +30652,117 @@ async function getChangedFiles(octokit) {
         return [];
     }
 }
+async function runManifestDrivenFlow(params) {
+    const { apiKey, engineUrl, appUrl, octokit, repoId, targetId, projectDir, branch, commitSha, commitMessage, devCommand, waitForUrl, startupTimeout, failOn, scanSha, } = params;
+    core.startGroup('Manifest-driven verification');
+    const startedAt = new Date().toISOString();
+    let localProcess = null;
+    let tunnelProcess = null;
+    let manifestResponse = null;
+    let manifest = null;
+    let effectiveTargetUrl = '';
+    try {
+        core.info(`Repo ID: ${repoId}`);
+        core.info(`Target ID: ${targetId}`);
+        manifestResponse = await post(`${appUrl}/api/verification/manifests`, {
+            repoId,
+            targetId,
+            repoPath: projectDir,
+            executionLocation: 'ci',
+            trigger: 'ci',
+            branch,
+            commitSha,
+            commitMessage,
+            includeDefaultPack: true,
+            createRun: true,
+        }, apiKey, 120_000);
+        validateManifestSignature(manifestResponse);
+        manifest = structuredClone(manifestResponse.manifest);
+        manifest.repoPath = manifest.repoPath ?? projectDir;
+        manifest.target.workingDirectory = manifest.target.workingDirectory ?? projectDir;
+        effectiveTargetUrl = manifest.target.originUrl;
+        core.info(`Manifest ${manifest.manifestId} prepared for ${manifestResponse.summary.targetName}`);
+        core.info(`Target: ${effectiveTargetUrl}`);
+        core.info(`Selected rules: ${manifest.rules.length}`);
+        if (manifestResponse.summary.pendingSpecAssets?.length) {
+            core.info(`Repo-path assets pending resolution: ${manifestResponse.summary.pendingSpecAssets.length}`);
+        }
+        if (manifest.target.launchCommand || devCommand) {
+            const launchCommand = devCommand || manifest.target.launchCommand;
+            const workingDirectory = manifest.target.workingDirectory && node_path_1.default.isAbsolute(manifest.target.workingDirectory)
+                ? manifest.target.workingDirectory
+                : node_path_1.default.join(projectDir, manifest.target.workingDirectory || '.');
+            core.info(`Starting managed target with "${launchCommand}" in ${workingDirectory}`);
+            localProcess = startLocalCommand(launchCommand, workingDirectory);
+            await (0, docker_js_1.waitForHealthy)(waitForUrl || effectiveTargetUrl, startupTimeout);
+        }
+        if (isLocalUrl(effectiveTargetUrl) && !isLocalUrl(engineUrl)) {
+            core.info('Exposing local target through a public tunnel for remote engine access');
+            const tunnel = await startLocalTunnel(effectiveTargetUrl);
+            tunnelProcess = tunnel.child;
+            effectiveTargetUrl = tunnel.publicUrl;
+            manifest.target.originUrl = tunnel.publicUrl;
+            manifest.target.allowedOrigins = [new URL(tunnel.publicUrl).origin];
+            await (0, docker_js_1.waitForHealthy)(waitForUrl ? replaceUrlOrigin(waitForUrl, effectiveTargetUrl) : effectiveTargetUrl, startupTimeout);
+            core.info(`Using tunnel URL: ${effectiveTargetUrl}`);
+        }
+        if (manifest.specAssets?.some((asset) => asset.sourceType === 'repo_path' && !asset.content)) {
+            core.info('Resolving repo-path spec assets from the workspace');
+            manifest = await resolveRepoPathAssets(manifest, projectDir);
+            core.info(`Resolved ${manifest.specAssets?.filter((asset) => asset.sourceType === 'repo_path' && asset.content).length ?? 0} repo-path asset(s)`);
+        }
+        const executionTimeoutMs = 15 * 60_000;
+        core.info(`Executing ${manifest.rules.length} manifest rule(s)`);
+        const result = await post(`${engineUrl}/execute-manifest`, {
+            manifest,
+            timeoutMs: executionTimeoutMs,
+        }, apiKey, executionTimeoutMs + 60_000);
+        if (manifestResponse.runId) {
+            await post(`${appUrl}/api/verification/report`, {
+                runId: manifestResponse.runId,
+                manifestId: manifest.manifestId,
+                result,
+            }, apiKey, 120_000);
+        }
+        const counts = countManifestStatuses(result);
+        core.info(`Manifest execution complete: ${counts.checked} checked, ${counts.violated} violated, ${counts.not_reached} not reached, ${counts.errored} errored`);
+        await upsertPrComment(octokit, formatManifestComment(manifestResponse, result, appUrl), scanSha);
+        core.setOutput('properties-count', result.propertyResults.length);
+        core.setOutput('bugs-found', counts.violated);
+        const totalVerified = counts.checked + counts.violated + counts.errored;
+        const score = totalVerified > 0 ? Math.round((counts.checked / totalVerified) * 100) : 0;
+        core.setOutput('score', score);
+        if (failOn !== 'never' && (counts.violated > 0 || counts.errored > 0)) {
+            const severityLabel = counts.violated > 0 ? 'violations' : 'execution errors';
+            core.setFailed(`Manifest verification found ${counts.violated > 0 ? counts.violated : counts.errored} ${severityLabel}.`);
+        }
+    }
+    catch (error) {
+        if (manifest && manifestResponse?.runId) {
+            const synthetic = createErroredManifestResult(manifest, effectiveTargetUrl || manifest.target.originUrl, error, startedAt);
+            try {
+                await post(`${appUrl}/api/verification/report`, {
+                    runId: manifestResponse.runId,
+                    manifestId: manifest.manifestId,
+                    result: synthetic,
+                }, apiKey, 120_000);
+            }
+            catch (reportError) {
+                core.warning(`Failed to report manifest execution error: ${reportError.message}`);
+            }
+        }
+        throw error;
+    }
+    finally {
+        if (tunnelProcess) {
+            await stopLocalCommand(tunnelProcess);
+        }
+        if (localProcess) {
+            await stopLocalCommand(localProcess);
+        }
+        core.endGroup();
+    }
+}
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -30672,6 +30919,7 @@ async function run() {
                         }, apiKey);
                     }
                     catch { /* non-fatal */ }
+                    await upsertPrComment(octokit, '### ○ Cardinality — Could not resolve test target\n\nThe local target could not be exposed as a healthy public URL for remote execution. Cardinality did not test properties on this attempt.', scanSha);
                     throw err;
                 }
                 finally {
@@ -31034,6 +31282,22 @@ module.exports = require("node:crypto");
 
 "use strict";
 module.exports = require("node:events");
+
+/***/ }),
+
+/***/ 1455:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:fs/promises");
+
+/***/ }),
+
+/***/ 6760:
+/***/ ((module) => {
+
+"use strict";
+module.exports = require("node:path");
 
 /***/ }),
 
