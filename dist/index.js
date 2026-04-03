@@ -30603,6 +30603,7 @@ async function run() {
                         commitSha: scanSha,
                         scanResult,
                         reason: 'no_relevant_properties',
+                        targetMode,
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
