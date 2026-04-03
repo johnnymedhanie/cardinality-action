@@ -30697,6 +30697,11 @@ async function run() {
                     author: github.context.actor,
                     scanResult: { properties: prioritized },
                     scopedPropertyCount: prioritized.length,
+                    totalInferredPropertyCount: scanResult.properties.length,
+                    totalTestablePropertyCount: scanResult.properties.filter((property) => {
+                        const value = property.testability;
+                        return value === 'public' || value === 'authenticated' || value === 'admin';
+                    }).length,
                     framework: 'express',
                     targetMode,
                 }, apiKey);
