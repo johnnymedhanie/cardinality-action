@@ -30137,6 +30137,47 @@ async function stopLocalCommand(child) {
         });
     });
 }
+function isLocalUrl(url) {
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(url);
+}
+async function startLocalTunnel(localUrl) {
+    const parsed = new URL(localUrl);
+    const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+    const child = (0, node_child_process_1.spawn)('npx', ['-y', 'localtunnel', '--port', port], {
+        env: process.env,
+        cwd: process.env.GITHUB_WORKSPACE || '.',
+        stdio: 'pipe',
+    });
+    readOutput(child.stdout, 'tunnel');
+    readOutput(child.stderr, 'tunnel');
+    const publicUrl = await new Promise((resolve, reject) => {
+        const timeout = setTimeout(() => {
+            reject(new Error(`Timed out waiting for public tunnel for ${localUrl}`));
+        }, 45_000);
+        const handleChunk = (chunk) => {
+            const text = chunk.toString();
+            const match = text.match(/https:\/\/[a-z0-9.-]+/i);
+            if (match?.[0]) {
+                cleanup();
+                resolve(match[0]);
+            }
+        };
+        const handleExit = (code) => {
+            cleanup();
+            reject(new Error(`Local tunnel exited before publishing a URL (code: ${code ?? 'unknown'})`));
+        };
+        const cleanup = () => {
+            clearTimeout(timeout);
+            child.stdout.off('data', handleChunk);
+            child.stderr.off('data', handleChunk);
+            child.off('exit', handleExit);
+        };
+        child.stdout.on('data', handleChunk);
+        child.stderr.on('data', handleChunk);
+        child.once('exit', handleExit);
+    });
+    return { child, publicUrl };
+}
 async function resolvePreviewUrl(explicitPreviewUrl, octokit, sha) {
     if (explicitPreviewUrl)
         return explicitPreviewUrl;
@@ -30476,6 +30517,7 @@ async function run() {
         // 2. Start a local target when requested
         let dockerStarted = false;
         let localProcess = null;
+        let tunnelProcess = null;
         let resolvedBaseUrl = baseUrlInput || '';
         if (!scanOnly && targetMode === 'local' && devCommand) {
             core.startGroup('Starting local application');
@@ -30567,6 +30609,33 @@ async function run() {
                 core.setOutput('bugs-found', 0);
                 core.setOutput('score', 0);
                 return;
+            }
+            if (!scanOnly && targetMode === 'local' && isLocalUrl(effectiveBaseUrl) && !isLocalUrl(engineUrl)) {
+                core.startGroup('Exposing local application to remote engine');
+                try {
+                    const tunnel = await startLocalTunnel(effectiveBaseUrl);
+                    tunnelProcess = tunnel.child;
+                    effectiveBaseUrl = tunnel.publicUrl;
+                    core.info(`Using tunnel URL for remote engine: ${effectiveBaseUrl}`);
+                }
+                catch (err) {
+                    try {
+                        await post(`${appUrl}/api/ci/report`, {
+                            kind: 'failed',
+                            repoFullName,
+                            branch,
+                            commitSha: scanSha,
+                            failureStage: 'target_resolution',
+                            errorDetails: err.message,
+                            targetMode,
+                        }, apiKey);
+                    }
+                    catch { /* non-fatal */ }
+                    throw err;
+                }
+                finally {
+                    core.endGroup();
+                }
             }
             // 5. Incremental scoping
             core.startGroup('Scoping properties to changed files');
@@ -30766,6 +30835,11 @@ async function run() {
             }
         }
         finally {
+            if (tunnelProcess) {
+                core.startGroup('Stopping public tunnel');
+                await stopLocalCommand(tunnelProcess);
+                core.endGroup();
+            }
             if (localProcess) {
                 core.startGroup('Stopping local application');
                 await stopLocalCommand(localProcess);
