@@ -30137,7 +30137,7 @@ async function stopLocalCommand(child) {
         });
     });
 }
-async function resolvePreviewUrl(explicitPreviewUrl, octokit) {
+async function resolvePreviewUrl(explicitPreviewUrl, octokit, sha) {
     if (explicitPreviewUrl)
         return explicitPreviewUrl;
     if (!octokit) {
@@ -30148,7 +30148,7 @@ async function resolvePreviewUrl(explicitPreviewUrl, octokit) {
         const { data: deployments } = await octokit.rest.repos.listDeployments({
             owner,
             repo,
-            sha: github.context.sha,
+            sha,
             per_page: 20,
         });
         for (const deployment of deployments) {
@@ -30385,7 +30385,7 @@ function formatNoOpComment(reason, propertiesTotal, appUrl) {
 // ---------------------------------------------------------------------------
 // PR comment / check run upsert
 // ---------------------------------------------------------------------------
-async function upsertPrComment(octokit, body) {
+async function upsertPrComment(octokit, body, headSha) {
     if (!octokit) {
         core.warning('Skipping GitHub comment/check reporting because no GitHub token was provided.');
         return;
@@ -30412,10 +30412,10 @@ async function upsertPrComment(octokit, body) {
         const { owner, repo } = context.repo;
         await octokit.rest.checks.create({
             owner, repo, name: 'Cardinality — Correctness Testing',
-            head_sha: context.sha, status: 'completed', conclusion: 'neutral',
+            head_sha: headSha ?? context.sha, status: 'completed', conclusion: 'neutral',
             output: { title: 'Cardinality Results', summary: markedBody },
         });
-        core.info(`Created check run on commit ${context.sha}`);
+        core.info(`Created check run on commit ${headSha ?? context.sha}`);
     }
 }
 // ---------------------------------------------------------------------------
@@ -30463,13 +30463,16 @@ async function run() {
         if (!ghToken) {
             core.warning('No GitHub token available; falling back to full-scope testing and skipping GitHub reporting.');
         }
-        const repoPath = process.env.GITHUB_WORKSPACE || '.';
         const repoFullName = `${github.context.repo.owner}/${github.context.repo.repo}`;
+        const repoPath = repoFullName;
         const isPR = !!github.context.payload.pull_request;
         const pullRequest = github.context.payload.pull_request;
         const branch = isPR
             ? pullRequest?.head?.ref ?? ''
             : github.context.ref?.replace('refs/heads/', '') ?? '';
+        const scanSha = isPR
+            ? pullRequest?.head?.sha ?? github.context.sha
+            : github.context.sha;
         // 2. Start a local target when requested
         let dockerStarted = false;
         let localProcess = null;
@@ -30511,15 +30514,18 @@ async function run() {
             core.startGroup('Scanning codebase for correctness properties');
             const scanResult = await post(`${engineUrl}/scan`, {
                 repoPath,
+                githubToken: ghToken || undefined,
+                cloneRef: branch || undefined,
+                cloneSha: scanSha,
                 language: 'typescript',
-                repo: { owner: github.context.repo.owner, name: github.context.repo.repo, sha: github.context.sha, ref: github.context.ref },
+                repo: { owner: github.context.repo.owner, name: github.context.repo.repo, sha: scanSha, ref: branch || github.context.ref },
             }, apiKey);
             core.info(`Found ${scanResult.properties.length} properties across ${scanResult.stats.routesFound} routes`);
             core.endGroup();
             let effectiveBaseUrl = resolvedBaseUrl;
             if (!scanOnly && targetMode === 'preview') {
                 try {
-                    effectiveBaseUrl = await resolvePreviewUrl(previewUrlInput, octokit);
+                    effectiveBaseUrl = await resolvePreviewUrl(previewUrlInput, octokit, scanSha);
                     await (0, docker_js_1.waitForHealthy)(waitForUrl || effectiveBaseUrl, startupTimeout);
                 }
                 catch (err) {
@@ -30527,12 +30533,12 @@ async function run() {
                         kind: 'failed',
                         repoFullName,
                         branch,
-                        commitSha: github.context.sha,
+                        commitSha: scanSha,
                         failureStage: 'target_resolution',
                         errorDetails: err.message,
                         targetMode,
                     }, apiKey).catch(() => undefined);
-                    await upsertPrComment(octokit, '### ○ Cardinality — Could not resolve test target\n\nPreview deployment could not be located or did not become healthy in time.');
+                    await upsertPrComment(octokit, '### ○ Cardinality — Could not resolve test target\n\nPreview deployment could not be located or did not become healthy in time.', scanSha);
                     throw err;
                 }
             }
@@ -30546,7 +30552,7 @@ async function run() {
                         kind: 'no_op',
                         repoFullName,
                         branch,
-                        commitSha: github.context.sha,
+                        commitSha: scanSha,
                         scanResult,
                         reason: scanOnly ? 'scan_only' : 'target_unresolved',
                         targetMode,
@@ -30556,7 +30562,7 @@ async function run() {
                 const noOpComment = scanOnly
                     ? formatScanOnlyComment(scanResult, appUrl)
                     : '### ○ Cardinality — Run inconclusive\n\nCardinality could not resolve a runnable target for this repository, so properties were cataloged but not tested.';
-                await upsertPrComment(octokit, noOpComment);
+                await upsertPrComment(octokit, noOpComment, scanSha);
                 core.setOutput('properties-count', scanResult.properties.length);
                 core.setOutput('bugs-found', 0);
                 core.setOutput('score', 0);
@@ -30594,13 +30600,13 @@ async function run() {
                         kind: 'no_op',
                         repoFullName,
                         branch,
-                        commitSha: github.context.sha,
+                        commitSha: scanSha,
                         scanResult,
                         reason: 'no_relevant_properties',
                     }, apiKey);
                 }
                 catch { /* non-fatal */ }
-                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length, appUrl));
+                await upsertPrComment(octokit, formatNoOpComment(reason, scanResult.properties.length, appUrl), scanSha);
                 core.setOutput('properties-count', scanResult.properties.length);
                 core.setOutput('bugs-found', 0);
                 core.setOutput('score', 100);
@@ -30614,7 +30620,7 @@ async function run() {
                     kind: 'init',
                     repoFullName,
                     branch,
-                    commitSha: github.context.sha,
+                    commitSha: scanSha,
                     commitMessage: github.context.payload.head_commit?.message ?? '',
                     prNumber: isPR ? github.context.payload.pull_request?.number : null,
                     prUrl: isPR ? github.context.payload.pull_request?.html_url : null,
@@ -30633,7 +30639,7 @@ async function run() {
                         kind: 'failed',
                         repoFullName,
                         branch,
-                        commitSha: github.context.sha,
+                        commitSha: scanSha,
                         failureStage: 'init',
                         errorDetails: err.message,
                     }, apiKey);
