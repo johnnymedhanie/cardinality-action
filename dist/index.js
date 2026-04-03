@@ -30091,17 +30091,31 @@ const CONFIDENCE_ICONS = {
 function severityMeetsThreshold(severity, threshold) {
     return SEVERITY_ORDER[severity] <= SEVERITY_ORDER[threshold];
 }
-async function post(url, body, apiKey) {
-    const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
-        body: JSON.stringify(body),
-    });
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`${res.status}: ${text}`);
+async function post(url, body, apiKey, timeoutMs = 60_000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const res = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${apiKey}` },
+            body: JSON.stringify(body),
+            signal: controller.signal,
+        });
+        if (!res.ok) {
+            const text = await res.text();
+            throw new Error(`${res.status}: ${text}`);
+        }
+        return (await res.json());
     }
-    return (await res.json());
+    catch (error) {
+        if (error.name === 'AbortError') {
+            throw new Error(`Request timed out after ${Math.round(timeoutMs / 1000)}s: ${url}`);
+        }
+        throw error;
+    }
+    finally {
+        clearTimeout(timeout);
+    }
 }
 function readOutput(stream, label) {
     stream.on('data', (chunk) => {
@@ -30154,6 +30168,13 @@ async function stopLocalCommand(child) {
 }
 function isLocalUrl(url) {
     return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(url);
+}
+function replaceUrlOrigin(url, origin) {
+    const source = new URL(url);
+    const targetOrigin = new URL(origin);
+    source.protocol = targetOrigin.protocol;
+    source.host = targetOrigin.host;
+    return source.toString();
 }
 async function startLocalTunnel(localUrl) {
     const parsed = new URL(localUrl);
@@ -30577,7 +30598,7 @@ async function run() {
                 cloneSha: scanSha,
                 language: 'typescript',
                 repo: { owner: github.context.repo.owner, name: github.context.repo.repo, sha: scanSha, ref: branch || github.context.ref },
-            }, apiKey);
+            }, apiKey, 120_000);
             core.info(`Found ${scanResult.properties.length} properties across ${scanResult.stats.routesFound} routes`);
             core.endGroup();
             let effectiveBaseUrl = resolvedBaseUrl;
@@ -30632,6 +30653,10 @@ async function run() {
                     const tunnel = await startLocalTunnel(effectiveBaseUrl);
                     tunnelProcess = tunnel.child;
                     effectiveBaseUrl = tunnel.publicUrl;
+                    const tunnelHealthUrl = waitForUrl
+                        ? replaceUrlOrigin(waitForUrl, effectiveBaseUrl)
+                        : effectiveBaseUrl;
+                    await (0, docker_js_1.waitForHealthy)(tunnelHealthUrl, startupTimeout);
                     core.info(`Using tunnel URL for remote engine: ${effectiveBaseUrl}`);
                 }
                 catch (err) {
@@ -30745,6 +30770,7 @@ async function run() {
             core.info(`Testing ${prioritized.length} properties (CI mode: 200 scenarios/property)`);
             let testRunResult;
             try {
+                const engineTestTimeoutMs = Math.max(180_000, timeBudget * 4_000);
                 testRunResult = await post(`${engineUrl}/test`, {
                     properties: prioritized,
                     config: {
@@ -30752,7 +30778,7 @@ async function run() {
                         maxScenariosPerProperty: 200,
                         codebase: scanResult.codebase,
                     },
-                }, apiKey);
+                }, apiKey, engineTestTimeoutMs);
                 core.info(`Tests complete: ${testRunResult.summary.propertiesPassed}/${testRunResult.summary.totalProperties} passing`);
             }
             catch (err) {
