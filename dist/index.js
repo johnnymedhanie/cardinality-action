@@ -30114,6 +30114,7 @@ function readOutput(stream, label) {
 function startLocalCommand(command) {
     const child = (0, node_child_process_1.spawn)(command, {
         shell: true,
+        detached: process.platform !== 'win32',
         env: process.env,
         cwd: process.env.GITHUB_WORKSPACE || '.',
         stdio: 'pipe',
@@ -30125,10 +30126,24 @@ function startLocalCommand(command) {
 async function stopLocalCommand(child) {
     if (!child || child.killed)
         return;
-    child.kill('SIGTERM');
+    const killTree = (signal) => {
+        if (!child.pid)
+            return;
+        if (process.platform !== 'win32') {
+            try {
+                process.kill(-child.pid, signal);
+                return;
+            }
+            catch {
+                // Fall back to killing the direct child when the process group is unavailable.
+            }
+        }
+        child.kill(signal);
+    };
+    killTree('SIGTERM');
     await new Promise((resolve) => {
         const timeout = setTimeout(() => {
-            child.kill('SIGKILL');
+            killTree('SIGKILL');
             resolve();
         }, 5000);
         child.once('exit', () => {
@@ -30144,6 +30159,7 @@ async function startLocalTunnel(localUrl) {
     const parsed = new URL(localUrl);
     const port = parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
     const child = (0, node_child_process_1.spawn)('npx', ['-y', 'localtunnel', '--port', port], {
+        detached: process.platform !== 'win32',
         env: process.env,
         cwd: process.env.GITHUB_WORKSPACE || '.',
         stdio: 'pipe',
